@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""
+CIS Benchmark PDF → Word (4-column table) — TOC‑safe v2
+
+Fixes vs previous:
+- Reliably skips Table of Contents lines (dotted leaders / trailing page numbers).
+- Rejects any "control" that doesn’t contain a Description: section nearby (filters TOC items).
+- Keeps the 4 columns: Control ID | Control Name & Description (title only) | Description | Remediation
+- Silences pdfminer CropBox warning noise.
+
+Usage
+-----
+python cis_pdf_word_table_v2.py \
+  --pdf "/mnt/data/CIS_IBM_WebSphere_Liberty_Benchmark_v1.0.0.pdf" \
+  --out "CIS_WebSphere_Liberty_Controls_FIXED.docx" \
+  [--include "4.1.2.1,1.6"]
+
+Requires: pdfminer.six, python-docx
+Install:  pip install pdfminer.six python-docx
+"""
+from __future__ import annotations
+
+import argparse
+import re
+import warnings
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"CropBox missing from /Page, defaulting to MediaBox",
+)
+
+try:
+    from pdfminer.high_level import extract_text
+except Exception as e:
+    raise SystemExit("pdfminer.six is required. Install it with: pip install pdfminer.six\n" + str(e))
+
+try:
+    from docx import Document
+    from docx.shared import Pt
+    from docx.oxml.ns import qn
+except Exception as e:
+    raise SystemExit("python-docx is required. Install it with: pip install python-docx\n" + str(e))
+
+# ------------------ Patterns ------------------
+CONTROL_HEADER_RX = re.compile(
+    r"^(?P<id>\d+(?:\.\d+){1,5})\s+(?P<title>.+?)\s*(?:\((?:Automated|Manual)\))?$"
+)
+SECTION_NAMES = [
+    "Description",
+    "Rationale",
+    "Impact",
+    "Audit",
+    "Default Value",
+    "Remediation",
+    "References",
+    "Profile Applicability",
+    "CIS Controls",
+]
+TOC_TITLE_RX = re.compile(r"^Table of Contents$", re.IGNORECASE)
+TOC_DOT_LEADER_RX = re.compile(r"\.\.\.+\s*\d+$")  # e.g., …… 15
+TRAILING_PAGE_NUM_RX = re.compile(r"\s+\d+$")  # e.g., ends with a page number
+PAGE_FOOTER_RX = re.compile(r"^Page\s+\d+\s*$", re.IGNORECASE)
+
+
+# ------------------ Helpers ------------------
+def collapse_spaces(s: str) -> str:
+    return re.sub(r"[ \t]+", " ", s).strip()
+
+
+def normalize_text(text: str) -> str:
+    text = text.replace("\u00A0", " ")
+    text = text.replace("\r", "")
+    # join hyphenated line breaks (simple heuristic)
+    text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)
+    return text
+
+
+def is_section_header(line: str) -> bool:
+    s = line.strip().rstrip(":")
+    return any(s.lower() == name.lower() for name in SECTION_NAMES)
+
+
+def is_control_header(line: str) -> bool:
+    m = CONTROL_HEADER_RX.match(line.strip())
+    return bool(m and "." in m.group("id"))
+
+
+def is_toc_like(line: str) -> bool:
+    # Obvious TOC artefacts: dotted leaders or trailing page numbers after lots of dots
+    if TOC_DOT_LEADER_RX.search(line):
+        return True
+    # Single-line TOC entry without dots but ending in a page number (common in some PDFs)
+    if is_control_header(line) and TRAILING_PAGE_NUM_RX.search(line):
+        # Only treat as TOC if there was at least some spacing before the number (avoid “4.1.2.1 title 50%”)
+        return True
+    # Bare page footer/header lines
+    if PAGE_FOOTER_RX.match(line):
+        return True
+    return False
+
+
+def text_to_lines(text: str) -> List[str]:
+    lines: List[str] = []
+    buf = ""
+    for raw in text.split("\n"):
+        line = raw.rstrip()
+        if not line.strip():
+            if buf:
+                lines.append(collapse_spaces(buf))
+                buf = ""
+            continue
+        # keep anchors*
+        if is_control_header(line) or is_section_header(line) or TOC_TITLE_RX.match(line.strip()) or is_toc_like(line) or PAGE_FOOTER_RX.match(line):
+            if buf:
+                lines.append(collapse_spaces(buf))
+                buf = ""
+            lines.append(collapse_spaces(line))
+            continue
+        # unwrap soft lines
+        if buf:
+            sep = "" if buf.endswith(" ") else " "
+            buf += sep + line.strip()
+        else:
+            buf = line.strip()
+    if buf:
+        lines.append(collapse_spaces(buf))
+    return lines
+
+
+def strip_table_of_contents(lines: List[str]) -> List[str]:
+    # Remove the TOC block if present: from "Table of Contents" until we hit
+    # a non‑TOC anchor like "Overview"/"Recommendation Definitions" etc.
+    if not any(TOC_TITLE_RX.match(ln) for ln in lines):
+        # No explicit TOC title; fall back to filtering toc‑like lines below
+        return [ln for ln in lines if not is_toc_like(ln)]
+
+    start = next(i for i, ln in enumerate(lines) if TOC_TITLE_RX.match(ln))
+    # Heuristic: skip forward while lines look like TOC, including blank-ish and page markers
+    i = start + 1
+    while i < len(lines):
+        ln = lines[i]
+        if is_toc_like(ln):
+            i += 1
+            continue
+        # End of TOC when we reach a narrative heading commonly found before recommendations
+        if ln in ("Overview", "Consensus Guidance", "Typographical Conventions", "Recommendation Definitions"):
+            break
+        # If we hit a control header here, it's *still* likely TOC — continue skipping
+        if is_control_header(ln):
+            i += 1
+            continue
+        # Otherwise assume TOC ended
+        break
+    # Drop [start, i)
+    pruned = lines[:start] + lines[i:]
+    # Also drop any residual toc‑like lines across the doc
+    pruned = [ln for ln in pruned if not is_toc_like(ln)]
+    return pruned
+
+
+@dataclass
+class Control:
+    cid: str
+    title: str
+    start: int
+    end: int
+
+
+def detect_controls(lines: List[str]) -> List[Control]:
+    controls: List[Control] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        ln = lines[i]
+        if is_control_header(ln) and not is_toc_like(ln):
+            m = CONTROL_HEADER_RX.match(ln)
+            cid = m.group("id")
+            title_part = m.group("title")
+
+            # grow title across wrapped lines until we hit a section header or another control
+            j = i + 1
+            title_parts = [title_part]
+            while j < n and not is_control_header(lines[j]) and not is_section_header(lines[j]):
+                # stop extending title if we see something toc‑like
+                if is_toc_like(lines[j]):
+                    j += 1
+                    continue
+                title_parts.append(lines[j])
+                j += 1
+            title = collapse_spaces(" ".join(title_parts))
+
+            # find end of this control block
+            k = j
+            while k < n and not is_control_header(lines[k]):
+                k += 1
+
+            # heuristic guard: ensure a Description section exists shortly after header (not dozens of pages away)
+            has_desc = False
+            for t in range(j, min(k, j + 80)):
+                if is_section_header(lines[t]) and lines[t].strip().rstrip(":").lower() == "description":
+                    has_desc = True
+                    break
+            if not has_desc:
+                # Likely a TOC entry or malformed hit — skip
+                i = k
+                continue
+
+            controls.append(Control(cid=cid, title=title, start=i, end=k))
+            i = k
+        else:
+            i += 1
+    return controls
+
+
+def extract_section(block: List[str], section_name: str) -> str:
+    try:
+        idx = next(i for i, ln in enumerate(block) if ln.strip().rstrip(":").lower() == section_name.lower())
+    except StopIteration:
+        return ""
+    body: List[str] = []
+    j = idx + 1
+    while j < len(block):
+        if is_section_header(block[j]) or is_control_header(block[j]) or is_toc_like(block[j]):
+            break
+        body.append(block[j])
+        j += 1
+    return "\n".join(body).strip()
+
+
+def write_word_table(controls: List[Control], lines: List[str], out_path: Path, includes: Optional[List[str]]) -> None:
+    doc = Document()
+    style = doc.styles['Normal']
+    style.font.name = 'Calibri'
+    style._element.rPr.rFonts.set(qn('w:eastAsia'), 'Calibri')
+    style.font.size = Pt(11)
+
+    table = doc.add_table(rows=1, cols=4)
+    hdr = table.rows[0].cells
+    hdr[0].text = 'Control Reference ID'
+    hdr[1].text = 'Control Name & Description'
+    hdr[2].text = 'Description'
+    hdr[3].text = 'Remediation'
+
+    for c in controls:
+        if includes and not any(c.cid.startswith(p) for p in includes):
+            continue
+        block = lines[c.start:c.end]
+        desc = extract_section(block, "Description")
+        rem  = extract_section(block, "Remediation")
+
+        row = table.add_row().cells
+        row[0].text = c.cid
+        row[1].text = c.title
+        row[2].text = desc
+        row[3].text = rem
+
+    doc.save(str(out_path))
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Export CIS controls to a 4‑column Word table (TOC‑safe)")
+    ap.add_argument("--pdf", required=True, help="Path to CIS Benchmark PDF")
+    ap.add_argument("--out", required=True, help="Output .docx path")
+    ap.add_argument("--include", help="Comma‑separated control ID prefixes to include (e.g., 4.1.2.1,1.6)")
+    args = ap.parse_args()
+
+    pdf_path = Path(args.pdf)
+    if not pdf_path.exists():
+        raise SystemExit(f"PDF not found: {pdf_path}")
+
+    raw = extract_text(str(pdf_path))
+    raw = normalize_text(raw)
+
+    lines = text_to_lines(raw)
+    lines = strip_table_of_contents(lines)
+
+    controls = detect_controls(lines)
+    print(f"Detected controls (with Description present): {len(controls)}")
+    for c in controls[:10]:
+        print(f" - {c.cid} {c.title}")
+    if len(controls) > 10:
+        print(f" ... and {len(controls) - 10} more")
+
+    includes = [s.strip() for s in args.include.split(',')] if args.include else None
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    write_word_table(controls, lines, out_path, includes)
+    print(f"Saved Word table to {out_path}")
+
+
+if __name__ == "__main__":
+    main()
