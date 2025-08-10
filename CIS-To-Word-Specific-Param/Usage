@@ -1,0 +1,1 @@
+python extract_cis_to_word.py --pdf "CIS_Red_Hat_Openshift_Container_Platform_Benchmark_v1.8.0_PDF.pdf" --out "CIS_OpenShift_Controls.docx"
